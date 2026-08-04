@@ -13,15 +13,19 @@ const ADVERTISEMENT_TOKEN_PARAM: &str = "advertisement_token";
 pub(crate) struct Handshake<S> {
     pub stream: WebSocketStream<S>,
     /// Token offered by the client, if any. Clients that do not implement the
-    /// extension never send it and are served normally.
+    /// extension never send it and are served normally. An empty value means
+    /// the client speaks the extension but has nothing cached (first connect):
+    /// it cannot suppress the catalogue, but it opts into token pushes.
     pub advertisement_token: Option<String>,
 }
 
-/// Extracts the advertisement token from a request query string.
+/// Extracts the advertisement token from a request query string. Presence of
+/// the parameter is meaningful on its own (extension opt-in), so empty values
+/// are preserved as `Some("")` rather than dropped.
 fn parse_advertisement_token(query: Option<&str>) -> Option<String> {
     query?.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=')?;
-        (key == ADVERTISEMENT_TOKEN_PARAM && !value.is_empty()).then(|| value.to_string())
+        (key == ADVERTISEMENT_TOKEN_PARAM).then(|| value.to_string())
     })
 }
 
@@ -87,13 +91,18 @@ mod tests {
     }
 
     #[test]
-    fn absent_or_empty_token_is_none() {
+    fn absent_token_is_none() {
         assert_eq!(parse_advertisement_token(None), None);
         assert_eq!(parse_advertisement_token(Some("")), None);
         assert_eq!(parse_advertisement_token(Some("foo=1")), None);
+    }
+
+    #[test]
+    fn empty_token_is_present() {
+        // Bare presence is the extension opt-in for token pushes.
         assert_eq!(
             parse_advertisement_token(Some("advertisement_token=")),
-            None
+            Some(String::new())
         );
     }
 }

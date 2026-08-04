@@ -16,7 +16,7 @@ use crate::library_version::get_library_version;
 use crate::sink_channel_filter::SinkChannelFilter;
 use crate::websocket::connected_client::ShutdownReason;
 use crate::websocket::streams::{Acceptor, StreamConfiguration, TlsIdentity};
-use crate::{Context, FoxgloveError};
+use crate::{Context, FoxgloveError, RawChannel};
 
 use super::connected_client::ConnectedClient;
 use super::cow_vec::CowVec;
@@ -38,6 +38,61 @@ const ADVERTISEMENT_TOKEN_METADATA_KEY: &str = "voliro-advertisement-token";
 // Queue up to 1024 messages per connected client before dropping messages
 // Can be overridden by ServerOptions::message_backlog_size.
 const DEFAULT_MESSAGE_BACKLOG_SIZE: usize = 1024;
+
+/// Hashes an advertisement catalogue into a token.
+///
+/// Fed either from the context snapshot (server info) or from a connected
+/// client's own advertised-channel view (token pushes) -- the latter because
+/// the `Sink` callbacks run with the context lock held, so a snapshot there
+/// would deadlock, and because the pushed token must describe what that
+/// client actually holds. Identical sets hash identically regardless of the
+/// source.
+pub(super) fn compute_advertisement_token(
+    mut channels: Vec<Arc<RawChannel>>,
+    mut services: Vec<(String, u32)>,
+) -> String {
+    // Two independent FNV-1a passes, concatenated: deterministic, no new
+    // dependency, and wide enough that a collision -- which would leave a
+    // client holding a stale catalogue -- is not a practical concern.
+    const OFFSET_BASIS_A: u64 = 0xcbf2_9ce4_8422_2325;
+    const OFFSET_BASIS_B: u64 = 0x9e37_79b9_7f4a_7c15;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash_a = OFFSET_BASIS_A;
+    let mut hash_b = OFFSET_BASIS_B;
+    let mut absorb = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash_a = (hash_a ^ u64::from(byte)).wrapping_mul(PRIME);
+            hash_b = (hash_b ^ u64::from(byte).rotate_left(3)).wrapping_mul(PRIME);
+        }
+        // Length-delimit, so concatenated fields cannot alias each other.
+        hash_a ^= bytes.len() as u64;
+        hash_b = hash_b.rotate_left(7) ^ bytes.len() as u64;
+    };
+
+    channels.sort_by_key(|channel| u64::from(channel.id()));
+    for channel in &channels {
+        absorb(&u64::from(channel.id()).to_le_bytes());
+        absorb(channel.topic().as_bytes());
+        absorb(channel.message_encoding().as_bytes());
+        if let Some(schema) = channel.schema() {
+            absorb(schema.name.as_bytes());
+            absorb(schema.encoding.as_bytes());
+            absorb(&schema.data);
+        }
+    }
+
+    // Ids as well as names: a client caches the name-to-id mapping and
+    // calls services by id, so a restart that reassigns ids must invalidate
+    // the token even when the set of names is unchanged.
+    services.sort();
+    for (name, id) in &services {
+        absorb(name.as_bytes());
+        absorb(&id.to_le_bytes());
+    }
+
+    format!("{hash_a:016x}{hash_b:016x}")
+}
 
 #[derive(Default)]
 pub(crate) struct ServerOptions {
@@ -562,57 +617,22 @@ impl Server {
     /// keeps a reconnect from re-sending the whole channel and service
     /// catalogue. Any change to the set yields a different token, so a stale
     /// client simply receives the full advertisement as before.
-    fn advertisement_token(&self) -> String {
-        // Two independent FNV-1a passes, concatenated: deterministic, no new
-        // dependency, and wide enough that a collision -- which would leave a
-        // client holding a stale catalogue -- is not a practical concern.
-        const OFFSET_BASIS_A: u64 = 0xcbf2_9ce4_8422_2325;
-        const OFFSET_BASIS_B: u64 = 0x9e37_79b9_7f4a_7c15;
-        const PRIME: u64 = 0x0000_0100_0000_01b3;
+    pub(super) fn advertisement_token(&self) -> String {
+        let channels = self
+            .context
+            .upgrade()
+            .map(|context| context.channels_snapshot())
+            .unwrap_or_default();
+        compute_advertisement_token(channels, self.service_ids())
+    }
 
-        let mut hash_a = OFFSET_BASIS_A;
-        let mut hash_b = OFFSET_BASIS_B;
-        let mut absorb = |bytes: &[u8]| {
-            for &byte in bytes {
-                hash_a = (hash_a ^ u64::from(byte)).wrapping_mul(PRIME);
-                hash_b = (hash_b ^ u64::from(byte).rotate_left(3)).wrapping_mul(PRIME);
-            }
-            // Length-delimit, so concatenated fields cannot alias each other.
-            hash_a ^= bytes.len() as u64;
-            hash_b = hash_b.rotate_left(7) ^ bytes.len() as u64;
-        };
-
-        if let Some(context) = self.context.upgrade() {
-            let mut channels = context.channels_snapshot();
-            channels.sort_by_key(|channel| u64::from(channel.id()));
-            for channel in &channels {
-                absorb(&u64::from(channel.id()).to_le_bytes());
-                absorb(channel.topic().as_bytes());
-                absorb(channel.message_encoding().as_bytes());
-                if let Some(schema) = channel.schema() {
-                    absorb(schema.name.as_bytes());
-                    absorb(schema.encoding.as_bytes());
-                    absorb(&schema.data);
-                }
-            }
-        }
-
-        // Ids as well as names: a client caches the name-to-id mapping and
-        // calls services by id, so a restart that reassigns ids must invalidate
-        // the token even when the set of names is unchanged.
-        let mut services: Vec<(String, u32)> = self
-            .services
+    /// The current service catalogue as (name, id) pairs, for token hashing.
+    pub(super) fn service_ids(&self) -> Vec<(String, u32)> {
+        self.services
             .read()
             .values()
             .map(|service| (service.name().to_string(), service.id().into()))
-            .collect();
-        services.sort();
-        for (name, id) in &services {
-            absorb(name.as_bytes());
-            absorb(&id.to_le_bytes());
-        }
-
-        format!("{hash_a:016x}{hash_b:016x}")
+            .collect()
     }
 
     /// Builds a server info message.
@@ -709,6 +729,12 @@ impl Server {
         );
         if catalogue_is_current {
             client.suppress_initial_advertisement();
+        }
+        if offered_token.is_some() {
+            // The parameter was presented (even empty, as on a first connect
+            // with nothing cached): the client speaks the extension and gets
+            // the fresh token after every catalogue mutation.
+            client.enable_advertisement_token_push();
         }
         self.register_client_and_advertise(&client);
         client.run().await;
@@ -850,6 +876,8 @@ impl Server {
             return Ok(());
         }
 
+        // Computed once: the same catalogue state applies to every client.
+        let token = self.advertisement_token();
         let clients = self.clients.get();
         for client in clients.iter() {
             for (name, id) in &new_names {
@@ -859,6 +887,7 @@ impl Server {
                 );
             }
             client.send_control_msg(&msg);
+            client.send_advertisement_token(&token);
         }
 
         Ok(())
@@ -886,6 +915,8 @@ impl Server {
         // Prepare an unadvertisement.
         let msg = UnadvertiseServices::new(old_services.keys().map(|&id| id.into()));
 
+        // Computed once: the same catalogue state applies to every client.
+        let token = self.advertisement_token();
         let clients = self.clients.get();
         for client in clients.iter() {
             for (id, name) in &old_services {
@@ -895,6 +926,7 @@ impl Server {
                 );
             }
             client.send_control_msg(&msg);
+            client.send_advertisement_token(&token);
         }
     }
 

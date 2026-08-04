@@ -80,6 +80,11 @@ pub(super) struct ConnectedClient {
     /// current catalogue. Consumed by the first bulk `add_channels`, so any
     /// channel discovered later is advertised normally.
     suppress_initial_advertisement: AtomicBool,
+    /// Set when the client presented the `advertisement_token` query parameter
+    /// at handshake (even empty): it speaks the extension and is sent the
+    /// fresh token after every catalogue mutation, so the token it offers on
+    /// its next connection matches the catalogue it accumulated incrementally.
+    advertisement_token_push: AtomicBool,
 }
 
 impl std::fmt::Debug for ConnectedClient {
@@ -151,12 +156,18 @@ impl Sink for ConnectedClient {
         for channels in filtered_channels.chunks(ADVERTISE_CHANNEL_BATCH_SIZE) {
             self.advertise_channels(channels);
         }
+        // The catalogue this client holds just changed; hand it the matching
+        // token so its cache stays offerable across a reconnect. (On the
+        // suppressed path above the client's token is already current, so
+        // nothing is sent there.)
+        self.push_advertisement_token();
         // Clients subscribe asynchronously.
         None
     }
 
     fn remove_channel(&self, channel: &RawChannel) {
         self.unadvertise_channel(channel.id());
+        self.push_advertisement_token();
     }
 
     fn auto_subscribe(&self) -> bool {
@@ -201,6 +212,7 @@ impl ConnectedClient {
             server: server.clone(),
             shutdown_tx: parking_lot::Mutex::new(Some(shutdown_tx)),
             suppress_initial_advertisement: AtomicBool::new(false),
+            advertisement_token_push: AtomicBool::new(false),
         })
     }
 
@@ -214,6 +226,46 @@ impl ConnectedClient {
 
     pub fn is_initial_advertisement_suppressed(&self) -> bool {
         self.suppress_initial_advertisement.load(Ordering::SeqCst)
+    }
+
+    /// Opts this client into advertisement-token pushes; it presented the
+    /// `advertisement_token` query parameter, so it speaks the extension.
+    pub fn enable_advertisement_token_push(&self) {
+        self.advertisement_token_push.store(true, Ordering::SeqCst);
+    }
+
+    /// Sends `token` to the client if it opted in. Callers must enqueue this
+    /// on the control plane right after the catalogue mutation the token
+    /// describes: the client commits it on receipt, relying on socket
+    /// ordering to guarantee its cached catalogue already reflects the
+    /// mutation.
+    pub fn send_advertisement_token(&self, token: &str) {
+        if !self.advertisement_token_push.load(Ordering::SeqCst) {
+            return;
+        }
+        self.send_control_msg(Message::text(format!(
+            r#"{{"op":"voliroAdvertisementToken","token":"{token}"}}"#
+        )));
+    }
+
+    /// Computes the current token and sends it if this client opted in. Used
+    /// on the per-client channel mutation path; the service paths compute the
+    /// token once for all clients instead.
+    ///
+    /// The channel set is taken from this client's own advertised-channel
+    /// view, NOT from the context: the `Sink` callbacks that call this run
+    /// with the context lock held (a snapshot would deadlock), and the pushed
+    /// token must describe what this client holds anyway.
+    fn push_advertisement_token(&self) {
+        if !self.advertisement_token_push.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(server) = self.server.upgrade() else {
+            return;
+        };
+        let channels: Vec<_> = self.channels.read().values().cloned().collect();
+        let token = super::server::compute_advertisement_token(channels, server.service_ids());
+        self.send_advertisement_token(&token);
     }
 
     pub fn id(&self) -> ClientId {
@@ -334,6 +386,14 @@ impl ConnectedClient {
     }
 
     /// Called when the server finally drops the connection.
+    ///
+    /// Deliberately does NOT unadvertise the client's client-published
+    /// channels (nor should any bridge built on this server): tearing them
+    /// down here mutates the catalogue at the exact moment the departed
+    /// client cannot observe it, so a client that reconnects moments later
+    /// (radio blip) would present a token that can never match and re-pull
+    /// the full catalogue -- defeating the advertisement-token extension. Any
+    /// future cleanup needs a grace period well beyond reconnect time.
     pub fn on_disconnect(&self) {
         let channel_ids = self.subscriptions.lock().left_values().copied().collect();
         self.unsubscribe_channel_ids(channel_ids);
