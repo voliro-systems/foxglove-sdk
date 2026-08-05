@@ -10,6 +10,10 @@ env:
 
 jobs:
   release:
+    # Voliro fork: upstream-only housekeeping (merges the release tag into
+    # main and deletes the release branch) using a bot token the fork does
+    # not have. Neither is wanted here -- main mirrors upstream.
+    if: github.repository == 'foxglove/foxglove-sdk'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
