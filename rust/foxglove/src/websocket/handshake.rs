@@ -21,10 +21,12 @@ pub(crate) struct Handshake<S> {
 
 /// Extracts the advertisement token from a request query string. Presence of
 /// the parameter is meaningful on its own (extension opt-in), so empty values
-/// are preserved as `Some("")` rather than dropped.
+/// are preserved as `Some("")` rather than dropped -- including the valueless
+/// form `?advertisement_token` without an `=`, which is how Dart's `Uri`
+/// renders an empty-valued query parameter.
 fn parse_advertisement_token(query: Option<&str>) -> Option<String> {
     query?.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         (key == ADVERTISEMENT_TOKEN_PARAM).then(|| value.to_string())
     })
 }
@@ -102,6 +104,15 @@ mod tests {
         // Bare presence is the extension opt-in for token pushes.
         assert_eq!(
             parse_advertisement_token(Some("advertisement_token=")),
+            Some(String::new())
+        );
+        // Dart's Uri renders an empty value with no '=' at all.
+        assert_eq!(
+            parse_advertisement_token(Some("advertisement_token")),
+            Some(String::new())
+        );
+        assert_eq!(
+            parse_advertisement_token(Some("foo=1&advertisement_token")),
             Some(String::new())
         );
     }
