@@ -16,7 +16,7 @@ use crate::library_version::get_library_version;
 use crate::sink_channel_filter::SinkChannelFilter;
 use crate::websocket::connected_client::ShutdownReason;
 use crate::websocket::streams::{Acceptor, StreamConfiguration, TlsIdentity};
-use crate::{Context, FoxgloveError};
+use crate::{Context, FoxgloveError, RawChannel};
 
 use super::connected_client::ConnectedClient;
 use super::cow_vec::CowVec;
@@ -30,9 +30,69 @@ use super::{
     ServerListener, Status,
 };
 
+/// Server-info metadata key carrying the advertisement catalogue fingerprint.
+/// Clients replay this value as the `advertisement_token` query parameter on a
+/// later connection to be spared a catalogue they already hold.
+const ADVERTISEMENT_TOKEN_METADATA_KEY: &str = "advertisement-token";
+
 // Queue up to 1024 messages per connected client before dropping messages
 // Can be overridden by ServerOptions::message_backlog_size.
 const DEFAULT_MESSAGE_BACKLOG_SIZE: usize = 1024;
+
+/// Hashes an advertisement catalogue into a token.
+///
+/// Fed either from the context snapshot (server info) or from a connected
+/// client's own advertised-channel view (token pushes) -- the latter because
+/// the `Sink` callbacks run with the context lock held, so a snapshot there
+/// would deadlock, and because the pushed token must describe what that
+/// client actually holds. Identical sets hash identically regardless of the
+/// source.
+pub(super) fn compute_advertisement_token(
+    mut channels: Vec<Arc<RawChannel>>,
+    mut services: Vec<(String, u32)>,
+) -> String {
+    // Two independent FNV-1a passes, concatenated: deterministic, no new
+    // dependency, and wide enough that a collision -- which would leave a
+    // client holding a stale catalogue -- is not a practical concern.
+    const OFFSET_BASIS_A: u64 = 0xcbf2_9ce4_8422_2325;
+    const OFFSET_BASIS_B: u64 = 0x9e37_79b9_7f4a_7c15;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash_a = OFFSET_BASIS_A;
+    let mut hash_b = OFFSET_BASIS_B;
+    let mut absorb = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash_a = (hash_a ^ u64::from(byte)).wrapping_mul(PRIME);
+            hash_b = (hash_b ^ u64::from(byte).rotate_left(3)).wrapping_mul(PRIME);
+        }
+        // Length-delimit, so concatenated fields cannot alias each other.
+        hash_a ^= bytes.len() as u64;
+        hash_b = hash_b.rotate_left(7) ^ bytes.len() as u64;
+    };
+
+    channels.sort_by_key(|channel| u64::from(channel.id()));
+    for channel in &channels {
+        absorb(&u64::from(channel.id()).to_le_bytes());
+        absorb(channel.topic().as_bytes());
+        absorb(channel.message_encoding().as_bytes());
+        if let Some(schema) = channel.schema() {
+            absorb(schema.name.as_bytes());
+            absorb(schema.encoding.as_bytes());
+            absorb(&schema.data);
+        }
+    }
+
+    // Ids as well as names: a client caches the name-to-id mapping and
+    // calls services by id, so a restart that reassigns ids must invalidate
+    // the token even when the set of names is unchanged.
+    services.sort();
+    for (name, id) in &services {
+        absorb(name.as_bytes());
+        absorb(&id.to_le_bytes());
+    }
+
+    format!("{hash_a:016x}{hash_b:016x}")
+}
 
 #[derive(Default)]
 pub(crate) struct ServerOptions {
@@ -307,6 +367,13 @@ impl Server {
     /// Accept handler which spawns a new task for each incoming connection.
     async fn accept_connections(self: Arc<Self>, listener: TcpListener) {
         while let Ok((stream, addr)) = listener.accept().await {
+            // Disable Nagle's algorithm: live telemetry messages are small
+            // and latency-sensitive, and coalescing them against the
+            // receiver's delayed-ACK timer adds up to 200 ms of buffering
+            // per lone segment on low-rate connections.
+            if let Err(err) = stream.set_nodelay(true) {
+                tracing::warn!("Failed to set TCP_NODELAY for {addr}: {err}");
+            }
             if let Some(tasks) = self.tasks.lock().as_mut() {
                 tasks.spawn(self.clone().handle_connection(stream, addr));
             } else {
@@ -543,6 +610,31 @@ impl Server {
         }
     }
 
+    /// Fingerprint of everything this server advertises on connect.
+    ///
+    /// Handed to the client in server info; a client that offers the same token
+    /// back on a later connection is not told what it already knows, which
+    /// keeps a reconnect from re-sending the whole channel and service
+    /// catalogue. Any change to the set yields a different token, so a stale
+    /// client simply receives the full advertisement as before.
+    pub(super) fn advertisement_token(&self) -> String {
+        let channels = self
+            .context
+            .upgrade()
+            .map(|context| context.channels_snapshot())
+            .unwrap_or_default();
+        compute_advertisement_token(channels, self.service_ids())
+    }
+
+    /// The current service catalogue as (name, id) pairs, for token hashing.
+    pub(super) fn service_ids(&self) -> Vec<(String, u32)> {
+        self.services
+            .read()
+            .values()
+            .map(|service| (service.name().to_string(), service.id().into()))
+            .collect()
+    }
+
     /// Builds a server info message.
     fn server_info(&self) -> ServerInfo {
         let mut metadata = self.server_info.clone();
@@ -550,6 +642,10 @@ impl Server {
             tracing::warn!("Overwriting reserved server_info key 'fg-library'");
         }
         metadata.insert("fg-library".into(), get_library_version());
+        metadata.insert(
+            ADVERTISEMENT_TOKEN_METADATA_KEY.into(),
+            self.advertisement_token(),
+        );
 
         ServerInfo::new(&self.name)
             .with_capabilities(
@@ -592,12 +688,31 @@ impl Server {
             }
         };
 
-        let Ok(mut ws_stream) = handshake::do_handshake(stream).await else {
+        let Ok(handshake) = handshake::do_handshake(stream).await else {
             tracing::error!("Dropping client {addr}: handshake failed");
             return;
         };
+        let handshake::Handshake {
+            stream: mut ws_stream,
+            advertisement_token: offered_token,
+        } = handshake;
 
-        let message = Message::from(&self.server_info());
+        let server_info = self.server_info();
+        let current_token = server_info
+            .metadata
+            .get(ADVERTISEMENT_TOKEN_METADATA_KEY)
+            .cloned();
+        // Only suppress when the client proves it already holds exactly this
+        // catalogue. Anything else -- no token, an old one, a different server
+        // -- advertises in full.
+        let catalogue_is_current = offered_token.is_some() && offered_token == current_token;
+        if catalogue_is_current {
+            tracing::info!(
+                "Client {addr} already holds the current advertisement catalogue; skipping it"
+            );
+        }
+
+        let message = Message::from(&server_info);
         if let Err(err) = ws_stream.send(message).await {
             // ServerInfo is required; do not store this client.
             tracing::error!("Failed to send required server info: {err}");
@@ -612,6 +727,15 @@ impl Server {
             self.message_backlog_size as usize,
             self.channel_filter.clone(),
         );
+        if catalogue_is_current {
+            client.suppress_initial_advertisement();
+        }
+        if offered_token.is_some() {
+            // The parameter was presented (even empty, as on a first connect
+            // with nothing cached): the client speaks the extension and gets
+            // the fresh token after every catalogue mutation.
+            client.enable_advertisement_token_push();
+        }
         self.register_client_and_advertise(&client);
         client.run().await;
         self.unregister_client(&client);
@@ -634,10 +758,21 @@ impl Server {
             listener.on_client_connect();
         }
 
+        // Read before add_sink, which consumes the flag.
+        let catalogue_is_current = client.is_initial_advertisement_suppressed();
+
         // Add the client as a sink. This synchronously triggers advertisements for all channels
         // via the `Sink::add_channel` callback.
         if let Some(context) = self.context.upgrade() {
             context.add_sink(client.clone());
+        }
+
+        if catalogue_is_current {
+            tracing::info!(
+                "Suppressed service advertisement to client {}: catalogue already current",
+                client.addr()
+            );
+            return;
         }
 
         // Advertise services.
@@ -741,6 +876,8 @@ impl Server {
             return Ok(());
         }
 
+        // Computed once: the same catalogue state applies to every client.
+        let token = self.advertisement_token();
         let clients = self.clients.get();
         for client in clients.iter() {
             for (name, id) in &new_names {
@@ -750,6 +887,7 @@ impl Server {
                 );
             }
             client.send_control_msg(&msg);
+            client.send_advertisement_token(&token);
         }
 
         Ok(())
@@ -777,6 +915,8 @@ impl Server {
         // Prepare an unadvertisement.
         let msg = UnadvertiseServices::new(old_services.keys().map(|&id| id.into()));
 
+        // Computed once: the same catalogue state applies to every client.
+        let token = self.advertisement_token();
         let clients = self.clients.get();
         for client in clients.iter() {
             for (id, name) in &old_services {
@@ -786,6 +926,7 @@ impl Server {
                 );
             }
             client.send_control_msg(&msg);
+            client.send_advertisement_token(&token);
         }
     }
 

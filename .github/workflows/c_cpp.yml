@@ -66,69 +66,10 @@ jobs:
             skip_upload: true
             test_debug: true
 
-          # macOS
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            staticlib_name: libfoxglove.a
-            cdylib_name: libfoxglove.dylib
-            staticlib_artifact_name: libfoxglove-aarch64-apple-darwin.a
-            cdylib_artifact_name: libfoxglove-aarch64-apple-darwin.dylib
-            cross: false
-            test_debug: true
-
-          - runner: macos-15
-            target: x86_64-apple-darwin
-            staticlib_name: libfoxglove.a
-            cdylib_name: libfoxglove.dylib
-            staticlib_artifact_name: libfoxglove-x86_64-apple-darwin.a
-            cdylib_artifact_name: libfoxglove-x86_64-apple-darwin.dylib
-            cross: true
-            test_debug: false
-
-          # Windows
-          - runner: windows-2025
-            target: x86_64-pc-windows-msvc
-            staticlib_name: foxglove.lib
-            cdylib_name: foxglove.dll
-            staticlib_artifact_name: foxglove-x86_64-pc-windows-msvc.lib
-            cdylib_artifact_name: foxglove-x86_64-pc-windows-msvc.dll
-            cross: false
-            test_debug: false
-          - runner: windows-2025
-            target: aarch64-pc-windows-msvc
-            staticlib_name: foxglove.lib
-            cdylib_name: foxglove.dll
-            staticlib_artifact_name: foxglove-aarch64-pc-windows-msvc.lib
-            cdylib_artifact_name: foxglove-aarch64-pc-windows-msvc.dll
-            cross: true
-            test_debug: false
-
-          # iOS
-          - runner: macos-15
-            target: aarch64-apple-ios
-            staticlib_name: libfoxglove.a
-            cdylib_name: libfoxglove.dylib
-            staticlib_artifact_name: libfoxglove-aarch64-apple-ios.a
-            cdylib_artifact_name: libfoxglove-aarch64-apple-ios.dylib
-            cross: true
-            test_debug: false
-          # iOS simulator
-          - runner: macos-15
-            target: aarch64-apple-ios-sim
-            staticlib_name: libfoxglove.a
-            cdylib_name: libfoxglove.dylib
-            staticlib_artifact_name: libfoxglove-aarch64-apple-ios-sim.a
-            cdylib_artifact_name: libfoxglove-aarch64-apple-ios-sim.dylib
-            cross: true
-            test_debug: false
-          - runner: macos-15
-            target: x86_64-apple-ios
-            staticlib_name: libfoxglove.a
-            cdylib_name: libfoxglove.dylib
-            staticlib_artifact_name: libfoxglove-x86_64-apple-ios.a
-            cdylib_artifact_name: libfoxglove-x86_64-apple-ios.dylib
-            cross: true
-            test_debug: false
+          # Voliro fork: macOS/Windows/iOS matrix entries removed. Only the
+          # two Linux targets are consumed (voliro-main thirdparty pin), and
+          # the Windows builds fail on a runner-image MSVC issue, blocking
+          # the draft-release job.
 
     name: build (${{ matrix.target }}, ${{ matrix.compiler || 'default compiler' }})
     runs-on: ${{ matrix.runner }}
