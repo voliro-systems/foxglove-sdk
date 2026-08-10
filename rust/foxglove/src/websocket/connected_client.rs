@@ -244,7 +244,7 @@ impl ConnectedClient {
             return;
         }
         self.send_control_msg(Message::text(format!(
-            r#"{{"op":"voliroAdvertisementToken","token":"{token}"}}"#
+            r#"{{"op":"advertisementToken","token":"{token}"}}"#
         )));
     }
 

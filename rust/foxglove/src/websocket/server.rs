@@ -33,7 +33,7 @@ use super::{
 /// Server-info metadata key carrying the advertisement catalogue fingerprint.
 /// Clients replay this value as the `advertisement_token` query parameter on a
 /// later connection to be spared a catalogue they already hold.
-const ADVERTISEMENT_TOKEN_METADATA_KEY: &str = "voliro-advertisement-token";
+const ADVERTISEMENT_TOKEN_METADATA_KEY: &str = "advertisement-token";
 
 // Queue up to 1024 messages per connected client before dropping messages
 // Can be overridden by ServerOptions::message_backlog_size.

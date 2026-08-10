@@ -110,11 +110,11 @@ async fn test_client_connect() {
     let msg = expect_recv!(client, ServerMessage::ServerInfo);
     // The advertisement token is server-derived and varies with the channel
     // and service set, so compare everything else and assert its presence.
-    assert!(msg.metadata.contains_key("voliro-advertisement-token"));
+    assert!(msg.metadata.contains_key("advertisement-token"));
     let mut expected_metadata = maplit::hashmap! {"fg-library".into() => get_library_version()};
     expected_metadata.insert(
-        "voliro-advertisement-token".into(),
-        msg.metadata["voliro-advertisement-token"].clone(),
+        "advertisement-token".into(),
+        msg.metadata["advertisement-token"].clone(),
     );
     assert_eq!(
         msg,
@@ -460,7 +460,7 @@ async fn test_advertisement_token_suppresses_catalogue_but_keeps_subscriptions()
     let info = expect_recv!(first, ServerMessage::ServerInfo);
     let token = info
         .metadata
-        .get("voliro-advertisement-token")
+        .get("advertisement-token")
         .expect("server info carries an advertisement token")
         .clone();
     let advertise = expect_recv!(first, ServerMessage::Advertise);
@@ -477,7 +477,7 @@ async fn test_advertisement_token_suppresses_catalogue_but_keeps_subscriptions()
     .expect("Failed to connect");
     let info = expect_recv!(second, ServerMessage::ServerInfo);
     assert_eq!(
-        info.metadata.get("voliro-advertisement-token"),
+        info.metadata.get("advertisement-token"),
         Some(&token)
     );
 
@@ -1872,15 +1872,15 @@ async fn test_server_info_metadata_sent_to_client() {
 
     let msg = expect_recv!(client, ServerMessage::ServerInfo);
 
-    assert!(msg.metadata.contains_key("voliro-advertisement-token"));
+    assert!(msg.metadata.contains_key("advertisement-token"));
     let mut expected_metadata = hashmap! {
         "fg-library".into() => get_library_version(),
         "key1".into() => "val1".into(),
         "key2".into() => "val2".into(),
     };
     expected_metadata.insert(
-        "voliro-advertisement-token".into(),
-        msg.metadata["voliro-advertisement-token"].clone(),
+        "advertisement-token".into(),
+        msg.metadata["advertisement-token"].clone(),
     );
     assert_eq!(msg.metadata, expected_metadata);
 
